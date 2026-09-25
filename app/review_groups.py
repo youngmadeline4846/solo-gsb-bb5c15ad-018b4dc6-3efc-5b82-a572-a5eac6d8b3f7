@@ -116,23 +116,30 @@ def apply_group_review(conn: sqlite3.Connection, *, group_key: str,
             row = db.get_match_log(conn, match_id)
             if row is None or row["status"] != "needs_review":
                 raise GroupConflict("组内存在已复核记录，整组未写入")
+            member_candidates = json.loads(row["candidates_json"])
             if action == "confirmed":
                 member_selected, member_score = row["candidate_id"], row["score"]
             elif action == "overridden":
                 member_selected = selected_id
                 member_scores = {
-                    c["address"]["id"]: c["score"]
-                    for c in json.loads(row["candidates_json"])
+                    c["address"]["id"]: c["score"] for c in member_candidates
                 }
                 member_score = member_scores[selected_id]
             else:  # rejected
                 member_selected, member_score = None, None
+            # Persist the chosen address's id + full text as a snapshot so the
+            # review replay can still show the original pick after the address
+            # row is deleted (the FK column alone would be nulled).
+            member_full_text = db.resolve_address_full_text(
+                conn, member_selected, member_candidates
+            )
             db.review_match_log(
                 conn,
                 match_id,
                 action=action,
                 selected_id=member_selected,
                 score=member_score,
+                selected_full_text=member_full_text,
             )
 
     return {

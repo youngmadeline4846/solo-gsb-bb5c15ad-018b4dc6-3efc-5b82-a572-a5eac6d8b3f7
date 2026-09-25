@@ -13,6 +13,17 @@ is not consulted) and the fresh verdict is compared with the human decision:
     - the replay now auto-hits some address                 -> ``false_hit``  误命中
     - the replay still does not auto-hit                    -> ``consistent`` 一致
 
+The human-chosen address is reconstructed from the **review-time snapshot**
+(``selected_id_snapshot`` / ``selected_full_text``) persisted when the review
+was written: unlike the FK column ``selected_id`` -- which the database
+nulls when the address row is deleted -- the snapshot survives deletion, so
+the replay can still show the original id, full text and review score, and
+only flags the address as deleted after checking the **current** address
+table. Records reviewed before snapshots existed (both the FK and the
+snapshot are empty) have no determinable selection: they are shown as
+"原选择未知" (original selection unknown) -- the replay never guesses a
+chosen address from the stored candidate list.
+
 Each item carries the original verdict (action, chosen address, review-time
 score), the current preferred candidate and score, plus a human-readable
 reason, so rule or address-table changes that endanger past decisions are
@@ -86,11 +97,23 @@ def _pct(value: float | None) -> str:
 def _classify(action: str, selected_id: int | None, selected_missing: bool,
               status: str, best_id: int | None, best_score: float | None
               ) -> tuple[str, str]:
-    """Replay category + human-readable reason for one reviewed record."""
+    """Replay category + human-readable reason for one reviewed record.
+
+    For positive decisions ``selected_id`` is the reconstructed original pick
+    (FK or review-time snapshot); ``None`` means the original selection is
+    not determinable (legacy record without a surviving snapshot).
+    """
     if action in ("confirmed", "overridden"):
-        chosen = f"#{selected_id}" if selected_id is not None else "（已删除地址）"
-        gone = "；注意人工所选地址已不在当前标准地址表中" if selected_missing else ""
-        if status == "auto_matched" and best_id == selected_id:
+        if selected_id is not None:
+            chosen = f"#{selected_id}"
+            gone = "；注意人工所选地址已删除（不在当前标准地址表中）" if selected_missing else ""
+        else:
+            # Legacy record: neither the FK nor a review-time snapshot
+            # survived, so the original pick cannot be determined -- say so
+            # explicitly instead of guessing from the candidate list.
+            chosen = "（原选择未知）"
+            gone = "；历史记录未保存所选地址快照，无法确定人工原选"
+        if status == "auto_matched" and selected_id is not None and best_id == selected_id:
             return CATEGORY_CONSISTENT, (
                 f"当前回放自动命中人工所选地址 {chosen}"
                 f"（{_pct(best_score)}），与人工结论一致"
@@ -136,23 +159,38 @@ def compute_replay(conn: sqlite3.Connection, settings: Settings,
     items: list[dict[str, Any]] = []
     for row in rows:
         action = row["review_action"]
-        selected_id = row["selected_id"]
 
-        # The human-chosen address text: prefer the live table, fall back to
-        # the candidate snapshot stored with the log (the address may be gone;
-        # the FK then already nulled selected_id).
+        # Reconstruct the human-chosen address. The FK column selected_id is
+        # nulled by the database when the address row is deleted, so the
+        # review-time snapshot (id + full text, no FK) is the durable source;
+        # whether the address is *deleted* is always judged against the
+        # current address table.
+        selected_known = True
         selected_missing = False
         selected_text = None
         if action in ("confirmed", "overridden"):
-            if selected_id is not None and selected_id in addr_by_id:
-                selected_text = addr_by_id[selected_id]["full_text"]
+            selected_id = row["selected_id"]
+            if selected_id is None:
+                selected_id = row["selected_id_snapshot"]
+            if selected_id is None:
+                # Reviewed before snapshots existed and the FK was nulled by
+                # a later deletion: the original pick is not determinable.
+                selected_known = False
             else:
-                selected_missing = True
-                if selected_id is not None:
-                    for cand in json.loads(row["candidates_json"] or "[]"):
-                        if cand["address"]["id"] == selected_id:
-                            selected_text = cand["address"]["full_text"]
-                            break
+                selected_missing = selected_id not in addr_by_id
+                if not selected_missing:
+                    selected_text = addr_by_id[selected_id]["full_text"]
+                else:
+                    selected_text = row["selected_full_text"]
+                    if selected_text is None:
+                        # Legacy row without a stored snapshot: the candidate
+                        # list may still carry the text for this *known* id.
+                        for cand in json.loads(row["candidates_json"] or "[]"):
+                            if cand["address"]["id"] == selected_id:
+                                selected_text = cand["address"]["full_text"]
+                                break
+        else:
+            selected_id = None
 
         # Pure scoring replay: no review-consensus lookup, nothing persisted.
         result = match_address(row["query"], addresses, settings)
@@ -171,6 +209,7 @@ def compute_replay(conn: sqlite3.Connection, settings: Settings,
             "review_action": action,
             "review_action_label": ACTION_LABELS.get(action, action),
             "selected_id": selected_id,
+            "selected_known": selected_known,
             "selected_full_text": selected_text,
             "selected_missing": selected_missing,
             "review_score": row["score"],

@@ -312,6 +312,8 @@ def _serialize_log(row: db.sqlite3.Row) -> dict[str, Any]:
         "score": row["score"],
         "candidate_id": row["candidate_id"],
         "selected_id": row["selected_id"],
+        "selected_id_snapshot": row["selected_id_snapshot"],
+        "selected_full_text": row["selected_full_text"],
         "token_score": row["token_score"],
         "house_score": row["house_score"],
         "matched_tokens": json.loads(row["matched_tokens"] or "[]"),
@@ -354,12 +356,14 @@ def review_match(match_id: int, payload: ReviewAction,
         raise HTTPException(status_code=404, detail="匹配记录不存在")
 
     score: float | None = None
+    selected_full_text: str | None = None
     if payload.action == "overridden":
         if payload.selected_id is None:
             raise HTTPException(status_code=400, detail="改派时必须提供 selected_id")
         target = db.get_address(conn, payload.selected_id)
         if target is None:
             raise HTTPException(status_code=404, detail="所选标准地址不存在")
+        selected_full_text = str(target["full_text"])
         candidates = json.loads(row["candidates_json"])
         for cand in candidates:
             if cand["address"]["id"] == payload.selected_id:
@@ -368,6 +372,11 @@ def review_match(match_id: int, payload: ReviewAction,
     elif payload.action == "confirmed":
         payload = ReviewAction(action="confirmed", selected_id=row["candidate_id"])
         score = row["score"]
+        # Snapshot the chosen address (id + full text) so a later replay can
+        # still show the original pick after the address row is deleted.
+        selected_full_text = db.resolve_address_full_text(
+            conn, payload.selected_id, json.loads(row["candidates_json"])
+        )
 
     with db.transaction(conn):
         db.review_match_log(
@@ -376,6 +385,7 @@ def review_match(match_id: int, payload: ReviewAction,
             action=payload.action,
             selected_id=payload.selected_id,
             score=score,
+            selected_full_text=selected_full_text,
         )
     return {"ok": True, "match_id": match_id, "action": payload.action,
             "selected_id": payload.selected_id}

@@ -188,9 +188,10 @@ def test_invalid_category_filter(client):
     assert r.status_code == 400
 
 
-def test_selected_address_deleted_marks_missing(client):
+def test_selected_address_deleted_keeps_snapshot(client):
     # Confirm an auto-hit, then delete the chosen address directly: the FK
-    # nulls selected_id and the replay marks the record as missing its target.
+    # nulls selected_id in the log row, but the replay restores the original
+    # id + full text from the review-time snapshot and flags it as deleted.
     r = client.post("/api/addresses", json={
         "addresses": [{"address": "555 Zxqwv Replaydel Avenue, Delton 90001"}],
         "skip_duplicates": True,
@@ -204,16 +205,208 @@ def test_selected_address_deleted_marks_missing(client):
     assert m["status"] == "auto_matched"
     _review(client, m["match_id"], "confirmed")
 
+    # The review persisted the snapshot alongside the FK.
+    log = client.get(f"/api/matches/{m['match_id']}").json()
+    assert log["selected_id"] == addr["id"]
+    assert log["selected_id_snapshot"] == addr["id"]
+    assert log["selected_full_text"] == addr["full_text"]
+
+    conn = get_conn()
+    conn.execute("DELETE FROM addresses WHERE id = ?", (addr["id"],))
+    conn.commit()
+    # The FK column itself is still nulled by the deletion...
+    assert client.get(f"/api/matches/{m['match_id']}").json()["selected_id"] is None
+
+    data = _replay(client)
+    item = _item_for(data, m["match_id"])
+    # ...but the replay shows the original pick from the snapshot.
+    assert item["selected_known"] is True
+    assert item["selected_id"] == addr["id"]
+    assert item["selected_full_text"] == addr["full_text"]
+    assert item["selected_missing"] is True
+    assert item["review_score"] == pytest.approx(m["best_score"])
+    assert item["category"] == "missed"
+    assert f"#{addr['id']}" in item["verdict_reason"]
+    assert "已删除" in item["verdict_reason"]
+
+
+def test_overridden_address_deleted_keeps_snapshot(client):
+    # An overridden (改派) decision is snapshotted the same way; after the
+    # chosen address is deleted the replay still names it and classifies the
+    # record as a conflict with the current auto-hit.
+    r = client.post("/api/addresses", json={
+        "addresses": [{"address": "77 Zxqwv Ovrsnap Road, Ovrton 90002"}],
+        "skip_duplicates": True,
+    })
+    assert r.json()["inserted"] == 1
+    addr = next(
+        a for a in client.get("/api/addresses?limit=500").json()["items"]
+        if "Ovrsnap" in a["full_text"]
+    )
+    m = _match_save(client, "77 Zxqwv Ovrsnap Rd, Ovrton 90002")
+    assert m["status"] == "auto_matched"
+    other = next(
+        c["address"]["id"] for c in m["candidates"]
+        if c["address"]["id"] != m["best_id"]
+    )
+    _review(client, m["match_id"], "overridden", other)
+
+    log = client.get(f"/api/matches/{m['match_id']}").json()
+    assert log["selected_id_snapshot"] == other
+    assert log["selected_full_text"]
+
+    conn = get_conn()
+    conn.execute("DELETE FROM addresses WHERE id = ?", (other,))
+    conn.commit()
+
+    item = _item_for(_replay(client), m["match_id"])
+    assert item["selected_known"] is True
+    assert item["selected_id"] == other
+    assert item["selected_full_text"] == log["selected_full_text"]
+    assert item["selected_missing"] is True
+    # the replay still auto-hits the remaining address -> conflict
+    assert item["category"] == "conflict"
+    assert item["replay_best_id"] == addr["id"]
+    assert f"#{other}" in item["verdict_reason"]
+    assert "已删除" in item["verdict_reason"]
+
+
+def test_group_review_persists_snapshot(client):
+    # Same-case merged review (整组确认首选): every member of the group gets
+    # the snapshot of the chosen address, which the replay keeps showing
+    # after the address is deleted.
+    r = client.post("/api/addresses", json={
+        "addresses": [{"address": "404 Zxqwv Grpsnap Blvd, Grptown 90003"}],
+        "skip_duplicates": True,
+    })
+    assert r.json()["inserted"] == 1
+    addr = next(
+        a for a in client.get("/api/addresses?limit=500").json()["items"]
+        if "Grpsnap" in a["full_text"]
+    )
+    # Two spellings of the same case: house 405 vs stored 404 -> needs_review,
+    # identical normalised key and candidate scores -> one review group.
+    m1 = _match_save(client, "405 Zxqwv Grpsnap Blvd, Grptown 90003")
+    m2 = _match_save(client, "405 Zxqwv Grpsnap Boulevard, Grptown 90003")
+    assert {m1["status"], m2["status"]} == {"needs_review"}
+
+    groups = client.get("/api/review-groups").json()["groups"]
+    group = next(
+        g for g in groups
+        if {m1["match_id"], m2["match_id"]} == set(g["match_ids"])
+    )
+    r = client.post("/api/review-groups/review", json={
+        "group_key": group["group_key"],
+        "match_ids": group["match_ids"],
+        "action": "confirmed",
+    })
+    assert r.status_code == 200, r.text
+
+    for mid in (m1["match_id"], m2["match_id"]):
+        log = client.get(f"/api/matches/{mid}").json()
+        assert log["review_action"] == "confirmed"
+        assert log["selected_id_snapshot"] == addr["id"]
+        assert log["selected_full_text"] == addr["full_text"]
+
     conn = get_conn()
     conn.execute("DELETE FROM addresses WHERE id = ?", (addr["id"],))
     conn.commit()
 
     data = _replay(client)
-    item = _item_for(data, m["match_id"])
-    assert item["selected_missing"] is True
-    assert item["selected_id"] is None  # FK ON DELETE SET NULL
-    assert item["category"] == "missed"
-    assert "已删除" in item["verdict_reason"]
+    for mid in (m1["match_id"], m2["match_id"]):
+        item = _item_for(data, mid)
+        assert item["selected_known"] is True
+        assert item["selected_id"] == addr["id"]
+        assert item["selected_full_text"] == addr["full_text"]
+        assert item["selected_missing"] is True
+        assert item["category"] == "missed"
+
+
+def test_group_override_persists_snapshot(client):
+    # Same-case merged review (整组改派共同候选): the shared reassign target
+    # is snapshotted on every member and survives its later deletion.
+    r = client.post("/api/addresses", json={
+        "addresses": [
+            {"address": "404 Zxqwv Ovgrp Blvd, Ovgtown 90004"},
+            {"address": "406 Zxqwv Ovgrp Blvd, Ovgtown 90004"},
+        ],
+        "skip_duplicates": True,
+    })
+    assert r.json()["inserted"] == 2
+    addrs = {
+        a["house"]: a
+        for a in client.get("/api/addresses?limit=500").json()["items"]
+        if "Ovgrp" in a["full_text"]
+    }
+    target = addrs["406"]
+    # house 405 ties 404/406 -> needs_review for both spellings, one group.
+    m1 = _match_save(client, "405 Zxqwv Ovgrp Blvd, Ovgtown 90004")
+    m2 = _match_save(client, "No. 405 Zxqwv Ovgrp Blvd, Ovgtown 90004")
+    assert {m1["status"], m2["status"]} == {"needs_review"}
+
+    groups = client.get("/api/review-groups").json()["groups"]
+    group = next(
+        g for g in groups
+        if {m1["match_id"], m2["match_id"]} == set(g["match_ids"])
+    )
+    r = client.post("/api/review-groups/review", json={
+        "group_key": group["group_key"],
+        "match_ids": group["match_ids"],
+        "action": "overridden",
+        "selected_id": target["id"],
+    })
+    assert r.status_code == 200, r.text
+
+    for mid in (m1["match_id"], m2["match_id"]):
+        log = client.get(f"/api/matches/{mid}").json()
+        assert log["review_action"] == "overridden"
+        assert log["selected_id_snapshot"] == target["id"]
+        assert log["selected_full_text"] == target["full_text"]
+
+    conn = get_conn()
+    conn.execute("DELETE FROM addresses WHERE id = ?", (target["id"],))
+    conn.commit()
+
+    data = _replay(client)
+    for mid in (m1["match_id"], m2["match_id"]):
+        item = _item_for(data, mid)
+        assert item["selected_known"] is True
+        assert item["selected_id"] == target["id"]
+        assert item["selected_full_text"] == target["full_text"]
+        assert item["selected_missing"] is True
+        # 404 remains but only reaches needs_review -> 漏命中
+        assert item["category"] == "missed"
+        assert f"#{target['id']}" in item["verdict_reason"]
+
+
+def test_legacy_record_without_snapshot_shows_unknown(client):
+    # A record reviewed before snapshots existed: the FK was nulled when the
+    # address was deleted and no snapshot columns were ever written. The
+    # replay must say the original selection is unknown instead of guessing
+    # an address from the stored candidate list.
+    m = _match_save(client, "100 Lake Dr, Austin TX")
+    assert m["status"] == "auto_matched"
+    _review(client, m["match_id"], "confirmed")
+
+    # Simulate the legacy state: FK nulled by a deletion, no snapshot saved.
+    conn = get_conn()
+    conn.execute(
+        "UPDATE match_logs SET selected_id = NULL, selected_id_snapshot = NULL,"
+        " selected_full_text = NULL WHERE id = ?",
+        (m["match_id"],),
+    )
+    conn.commit()
+
+    item = _item_for(_replay(client), m["match_id"])
+    assert item["selected_known"] is False
+    assert item["selected_id"] is None
+    # no guessing from the candidate list even though candidates exist
+    assert item["selected_full_text"] is None
+    assert item["selected_missing"] is False
+    assert "原选择未知" in item["verdict_reason"]
+    # the replay auto-hit cannot be matched to the unknown pick -> conflict
+    assert item["category"] == "conflict"
+    assert item["replay_status"] == "auto_matched"
 
 
 def test_replay_is_read_only(client):

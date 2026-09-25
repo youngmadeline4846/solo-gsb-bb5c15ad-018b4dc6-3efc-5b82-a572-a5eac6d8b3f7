@@ -647,12 +647,19 @@ function renderReplayItem(item) {
     if (item.review_action === "rejected") {
         original = "<b>判无匹配</b>";
     } else if (item.selected_id !== null && item.selected_id !== undefined) {
+        // The original id + full text come from the review-time snapshot, so
+        // they survive deletion of the address row; "（已删除）" reflects the
+        // current address table.
         original = `<b>${escapeHtml(item.review_action_label)}</b> → ` +
             `#${item.selected_id} ${escapeHtml(item.selected_full_text || "")}` +
             `${item.selected_missing ? "（已删除）" : ""}` +
             `<span class="muted">（复核得分 ${pct(item.review_score)}）</span>`;
     } else {
-        original = `<b>${escapeHtml(item.review_action_label)}</b> → 所选地址已删除`;
+        // Legacy record: neither the FK nor a snapshot survived -- do not
+        // guess the original pick from the candidate list.
+        original = `<b>${escapeHtml(item.review_action_label)}</b> → ` +
+            `<span class="muted">原选择未知（历史记录未保存所选地址快照）</span>` +
+            `<span class="muted">（复核得分 ${pct(item.review_score)}）</span>`;
     }
     const bestLine = item.replay_best_id !== null && item.replay_best_id !== undefined
         ? `当前首选：<b>#${item.replay_best_id}</b> ${escapeHtml(item.replay_best_full_text || "")}` +

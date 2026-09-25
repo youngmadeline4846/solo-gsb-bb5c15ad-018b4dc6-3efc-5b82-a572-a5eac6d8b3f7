@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS match_logs (
     status           TEXT NOT NULL,          -- auto_matched | needs_review | no_match
     score            REAL,
     selected_id      INTEGER REFERENCES addresses(id) ON DELETE SET NULL,
+    -- Review-time snapshot of the human-chosen address. Unlike selected_id
+    -- (an FK nulled when the address row is deleted) these columns have no
+    -- FK and survive deletion, so a review replay can still show the
+    -- original id + full text of the chosen address.
+    selected_id_snapshot INTEGER,
+    selected_full_text   TEXT,
     candidate_id     INTEGER REFERENCES addresses(id) ON DELETE SET NULL,
     token_score      REAL,
     house_score      REAL,
@@ -101,6 +107,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(match_logs)")}
     if "consensus_json" not in cols:
         conn.execute("ALTER TABLE match_logs ADD COLUMN consensus_json TEXT")
+    if "selected_id_snapshot" not in cols:
+        conn.execute(
+            "ALTER TABLE match_logs ADD COLUMN selected_id_snapshot INTEGER"
+        )
+    if "selected_full_text" not in cols:
+        conn.execute("ALTER TABLE match_logs ADD COLUMN selected_full_text TEXT")
     conn.commit()
 
 
@@ -317,16 +329,46 @@ def get_match_log(conn: sqlite3.Connection, log_id: int) -> sqlite3.Row | None:
 
 
 def review_match_log(conn: sqlite3.Connection, log_id: int, *, action: str,
-                     selected_id: int | None, score: float | None) -> None:
+                     selected_id: int | None, score: float | None,
+                     selected_full_text: str | None = None) -> None:
+    """Record a human review decision.
+
+    Besides the FK column ``selected_id`` (nulled when the address row is
+    later deleted), the chosen address's id and full text are persisted in
+    snapshot columns without any FK, so a later review replay can still
+    reconstruct what the human picked even after the address is deleted.
+    """
     conn.execute(
         """
         UPDATE match_logs
            SET status = 'reviewed', review_action = ?, selected_id = ?,
+               selected_id_snapshot = ?, selected_full_text = ?,
                score = ?, reviewed_at = ?
          WHERE id = ?
         """,
-        (action, selected_id, score, _now(), log_id),
+        (action, selected_id, selected_id, selected_full_text,
+         score, _now(), log_id),
     )
+
+
+def resolve_address_full_text(conn: sqlite3.Connection, address_id: int | None,
+                              candidates: list[dict[str, Any]] | None = None
+                              ) -> str | None:
+    """Full text of an address for the review-time snapshot.
+
+    The live address table is authoritative; when the row is already gone
+    (e.g. deleted between matching and reviewing) the candidate snapshot
+    stored with the match log is used as the fallback.
+    """
+    if address_id is None:
+        return None
+    row = get_address(conn, address_id)
+    if row is not None:
+        return str(row["full_text"])
+    for cand in candidates or []:
+        if cand.get("address", {}).get("id") == address_id:
+            return cand["address"].get("full_text")
+    return None
 
 
 def count_match_logs(conn: sqlite3.Connection, status: str | None = None) -> int:
