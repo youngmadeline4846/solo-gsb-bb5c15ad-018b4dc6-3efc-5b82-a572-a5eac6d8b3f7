@@ -741,8 +741,13 @@ def test_consensus_target_address_deleted_keeps_verdict():
             conflicts=[],
             candidates=[],
         )
-        db.review_match_log(conn, log_id, action="confirmed",
-                            selected_id=address_id, score=0.5)
+        # Review through the persistence layer so the durable snapshot (ID +
+        # text) is written just like the single/group review APIs do.
+        db.review_match_log(
+            conn, log_id, action="confirmed",
+            selected_id=address_id, score=0.5,
+            selected_text="88 Consensus Way, Consensus City",
+        )
     conn.commit()
     conn.execute("DELETE FROM addresses WHERE id = ?", (address_id,))
     conn.commit()
@@ -750,6 +755,8 @@ def test_consensus_target_address_deleted_keeps_verdict():
     ver = consensus_mod.lookup_consensus(conn, "88 CONSENSUS WAY, CONSENSUS CITY")
     assert ver["state"] == "target_gone"
     assert ver["applied"] is False
-    # positive decisions whose target was deleted are counted as stale
-    assert ver["stale_count"] == 2
-    assert ver["evidence_count"] == 0
+    # The FK is nulled, but the durable snapshot still identifies the deleted
+    # target, so the evidence remains attributable (not stale/unknown).
+    assert ver["stale_count"] == 0
+    assert ver["evidence_count"] == 2
+    assert ver["target_id"] == address_id

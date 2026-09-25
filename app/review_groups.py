@@ -111,28 +111,43 @@ def apply_group_review(conn: sqlite3.Connection, *, group_key: str,
                 raise GroupReviewError("改派时必须提供 selected_id")
             if selected_id not in shared_ids:
                 raise GroupReviewError("所选地址不在该组的共同候选中")
+            override_text = next(
+                c["address"]["full_text"] for c in group["candidates"]
+                if c["address"]["id"] == selected_id
+            )
 
         for match_id in group["match_ids"]:
             row = db.get_match_log(conn, match_id)
             if row is None or row["status"] != "needs_review":
                 raise GroupConflict("组内存在已复核记录，整组未写入")
+            member_candidates = json.loads(row["candidates_json"])
             if action == "confirmed":
                 member_selected, member_score = row["candidate_id"], row["score"]
+                # Snapshot the chosen full text so the verdict survives a later
+                # deletion of the address row.
+                member_text = next(
+                    (c["address"]["full_text"] for c in member_candidates
+                     if c["address"]["id"] == row["candidate_id"]),
+                    None,
+                )
             elif action == "overridden":
                 member_selected = selected_id
+                member_text = override_text
                 member_scores = {
                     c["address"]["id"]: c["score"]
-                    for c in json.loads(row["candidates_json"])
+                    for c in member_candidates
                 }
                 member_score = member_scores[selected_id]
             else:  # rejected
                 member_selected, member_score = None, None
+                member_text = None
             db.review_match_log(
                 conn,
                 match_id,
                 action=action,
                 selected_id=member_selected,
                 score=member_score,
+                selected_text=member_text,
             )
 
     return {

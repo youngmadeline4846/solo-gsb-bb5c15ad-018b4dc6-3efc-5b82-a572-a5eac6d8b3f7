@@ -377,6 +377,8 @@ th { color: var(--muted); font-weight: 600; }
 .replay-cat.conflict { background: var(--red-bg); color: var(--red); }
 .replay-cat.missed { background: var(--amber-bg); color: var(--amber); }
 .replay-cat.false_hit { background: var(--purple-bg); color: var(--purple); }
+.replay-cat.unknown { background: var(--gray-bg); color: var(--muted); }
+.replay-unknown { color: var(--muted); font-weight: 600; }
 .replay-query { font-weight: 600; word-break: break-all; }
 .replay-meta { margin: 8px 0; word-break: break-all; }
 .replay-meta b { color: var(--ink); }

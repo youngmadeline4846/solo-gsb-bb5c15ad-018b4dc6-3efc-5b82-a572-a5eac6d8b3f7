@@ -312,6 +312,9 @@ def _serialize_log(row: db.sqlite3.Row) -> dict[str, Any]:
         "score": row["score"],
         "candidate_id": row["candidate_id"],
         "selected_id": row["selected_id"],
+        # Durable review-time snapshot (survives deletion of the address row).
+        "selected_address_id": row["selected_address_id"],
+        "selected_address_text": row["selected_address_text"],
         "token_score": row["token_score"],
         "house_score": row["house_score"],
         "matched_tokens": json.loads(row["matched_tokens"] or "[]"),
@@ -354,12 +357,14 @@ def review_match(match_id: int, payload: ReviewAction,
         raise HTTPException(status_code=404, detail="匹配记录不存在")
 
     score: float | None = None
+    selected_text: str | None = None
     if payload.action == "overridden":
         if payload.selected_id is None:
             raise HTTPException(status_code=400, detail="改派时必须提供 selected_id")
         target = db.get_address(conn, payload.selected_id)
         if target is None:
             raise HTTPException(status_code=404, detail="所选标准地址不存在")
+        selected_text = target["full_text"]
         candidates = json.loads(row["candidates_json"])
         for cand in candidates:
             if cand["address"]["id"] == payload.selected_id:
@@ -368,6 +373,19 @@ def review_match(match_id: int, payload: ReviewAction,
     elif payload.action == "confirmed":
         payload = ReviewAction(action="confirmed", selected_id=row["candidate_id"])
         score = row["score"]
+        # Persist the chosen address's own ID/full text even when it is only
+        # referenced via candidate_id (the candidates_json is the snapshot).
+        if row["candidate_id"] is not None:
+            chosen = db.get_address(conn, row["candidate_id"])
+            if chosen is not None:
+                selected_text = chosen["full_text"]
+            else:
+                # Defensive: candidate row gone before review; restore the text
+                # from the log's own candidate snapshot rather than losing it.
+                for cand in json.loads(row["candidates_json"]):
+                    if cand["address"]["id"] == row["candidate_id"]:
+                        selected_text = cand["address"]["full_text"]
+                        break
 
     with db.transaction(conn):
         db.review_match_log(
@@ -376,6 +394,7 @@ def review_match(match_id: int, payload: ReviewAction,
             action=payload.action,
             selected_id=payload.selected_id,
             score=score,
+            selected_text=selected_text,
         )
     return {"ok": True, "match_id": match_id, "action": payload.action,
             "selected_id": payload.selected_id}
@@ -435,8 +454,11 @@ def list_review_replay(category: str | None = None,
 
     确认/改派记录自动命中所选地址为 ``consistent``，命中其他地址为
     ``conflict``，未自动命中为 ``missed``；判无匹配记录出现自动命中为
-    ``false_hit``，否则为 ``consistent``。返回各类数量及原结论、当前首选
-    与得分，便于定位规则或地址表变化带来的风险。
+    ``false_hit``，否则为 ``consistent``。人工所选地址的 ID 与全文取自
+    复核写入时持久保存的快照（不随地址删除而消失），并用当前地址表判定
+    所选地址是否已删除；历史记录若已失去可确定的所选 ID 则归为
+    ``unknown``（原选择未知，不从候选列表猜测）。返回各类数量及原结论、
+    当前首选与得分，便于定位规则或地址表变化带来的风险。
 
     只读操作：不写入匹配日志，也不改动任何复核记录。
     """
@@ -444,7 +466,7 @@ def list_review_replay(category: str | None = None,
         raise HTTPException(
             status_code=400,
             detail="非法 category 过滤值，仅支持 "
-                   "consistent / conflict / missed / false_hit",
+                   "consistent / conflict / missed / false_hit / unknown",
         )
     return review_replay.compute_replay(conn, settings, category=category)
 

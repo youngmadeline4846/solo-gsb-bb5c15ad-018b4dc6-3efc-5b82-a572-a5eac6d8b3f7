@@ -154,7 +154,9 @@
                 （纯评分，不查询复核共识记忆），逐条对照人工结论：
                 确认 / 改派记录自动命中所选地址为<b>一致</b>，自动命中其他地址为<b>冲突</b>，
                 未自动命中为<b>漏命中</b>；判无匹配记录出现自动命中为<b>误命中</b>，否则为<b>一致</b>。
-                用于定位规则或地址表变化带来的风险；本页只读，不写入匹配日志，也不改动复核记录。
+                人工所选地址的 ID 与全文在复核写入时已持久保存，地址删除后仍可显示原 ID、全文与复核得分，
+                并按当前地址表标注其是否已删除；历史记录若已失去可确定的所选 ID，则标记为<b>原选择未知</b>，
+                不从候选列表猜测。用于定位规则或地址表变化带来的风险；本页只读，不写入匹配日志，也不改动复核记录。
             </p>
             <div class="row wrap">
                 <select id="replay-filter">
@@ -163,6 +165,7 @@
                     <option value="conflict">冲突</option>
                     <option value="missed">漏命中</option>
                     <option value="false_hit">误命中</option>
+                    <option value="unknown">原选择未知</option>
                 </select>
                 <button id="btn-refresh-replay" class="primary">重新回放</button>
                 <span id="replay-summary" class="hint"></span>

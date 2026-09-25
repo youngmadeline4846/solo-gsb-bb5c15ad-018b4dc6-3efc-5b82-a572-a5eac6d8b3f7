@@ -60,7 +60,8 @@ def lookup_consensus(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
     key = norm_key(query)
     rows = conn.execute(
         """
-        SELECT id, query, review_action, selected_id, candidate_id, reviewed_at
+        SELECT id, query, review_action, selected_id, selected_address_id,
+               selected_address_text, candidate_id, reviewed_at
           FROM match_logs
          WHERE status = 'reviewed' AND reviewed_at IS NOT NULL
          ORDER BY id
@@ -77,16 +78,24 @@ def lookup_consensus(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
         if row["review_action"] == "rejected":
             rejected += 1
             continue
-        if row["selected_id"] is None:
-            # A positive decision whose address later disappeared (the FK is
-            # declared ON DELETE SET NULL) is stale evidence, not a rejection.
+        # Prefer the durable review-time snapshot ID: unlike the FK column it
+        # is not nulled when the address row is deleted, so a verdict pointing
+        # at a now-deleted address can still be told apart from a legacy
+        # verdict whose original target is genuinely unknown.
+        target_id = row["selected_address_id"]
+        if target_id is None:
+            target_id = row["selected_id"]
+        if target_id is None:
+            # A positive decision with no determinable target (an address
+            # deleted before review-time snapshots existed) is stale evidence,
+            # not a rejection.
             stale += 1
             continue
-        targets.add(row["selected_id"])
+        targets.add(target_id)
         evidence.append({
             "match_id": row["id"],
             "action": row["review_action"],
-            "selected_id": row["selected_id"],
+            "selected_id": target_id,
             "reviewed_at": row["reviewed_at"],
         })
 
@@ -115,7 +124,21 @@ def lookup_consensus(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
             "applied": False,
             "reason": "历史复核结论指向了不同的标准地址，结论冲突，保持原判",
         }
-    if stale:
+
+    # A unanimous, known target that no longer exists: the durable snapshot
+    # keeps the ID even though the address row (and the FK) are gone.
+    if targets:
+        target_id = next(iter(targets))
+        if db.get_address(conn, target_id) is None:
+            return {
+                **base,
+                "state": "target_gone",
+                "applied": False,
+                "target_id": target_id,
+                "reason": f"共识指向的标准地址 #{target_id} 已不存在，保持原判",
+            }
+    elif stale:
+        # Only legacy records with a genuinely unknown original target remain.
         return {
             **base,
             "state": "target_gone",
@@ -125,6 +148,7 @@ def lookup_consensus(conn: sqlite3.Connection, query: str) -> dict[str, Any]:
                 "无法形成有效共识，保持原判"
             ),
         }
+
     if len(evidence) < MIN_EVIDENCE:
         return {
             **base,

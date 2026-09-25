@@ -9,7 +9,7 @@
 - 🌐 网页界面：单条/批量匹配、**规则 A/B 对照实验**、上传标准地址 CSV、待确认队列人工复核（含同案合并复核、复核共识记忆）、**地址覆盖缺口清单**
 - 🕳️ **地址覆盖缺口**：从已保存且状态为 `no_match` 的匹配日志生成缺口清单，按归一化后的**道路词元 + 地区词元 + 门牌号**归组（门牌号不同不算同一缺口），展示出现次数、原始查询示例与最近出现时间；每次打开清单都用**当前标准地址表与默认规则**重跑每组代表查询——现已能自动命中的组标为**已覆盖**并显示命中地址，其余标为**待补录**并显示当前首选候选，避免上传地址后仍把旧拒绝记录当作未解决。支持待补录 / 已覆盖筛选，全程只读、不写日志
 - 🩺 **标准地址自匹配巡检**：对当前表每条标准地址，以其全文作为查询、按默认规则在**完整地址表**上重新评分，只列出**未能自动命中自身 ID** 的记录。每条风险给出自身分数与所有得分不低于「自身分数 − 默认分差阈值」的其他地址（阻碍候选，**不受前五候选截断**），并按 **自身分数不足 / 首选偏移 / 分差歧义** 分类汇总；上传新表后刷新即重新计算，全程只读、不写日志
-- 🔁 **复核结论回放**：取全部已复核记录，以原查询在**当前标准地址表**上按**默认规则**重新匹配，逐条对照人工结论——确认/改派记录自动命中所选地址为**一致**、命中其他地址为**冲突**、未自动命中为**漏命中**，判无匹配记录出现自动命中为**误命中**；返回各类数量、原结论、当前首选与得分，支持按类别筛选，全程只读、不写日志也不改动复核记录
+- 🔁 **复核结论回放**：取全部已复核记录，以原查询在**当前标准地址表**上按**默认规则**重新匹配，逐条对照人工结论——确认/改派记录自动命中所选地址为**一致**、命中其他地址为**冲突**、未自动命中为**漏命中**，判无匹配记录出现自动命中为**误命中**。单条复核与同案组复核写入时会**持久保存所选地址的 ID 与全文快照**（普通列、非外键，地址删除也不消失），回放始终展示原 ID、全文与复核得分，并用当前地址表标注所选地址是否已删除；历史记录若在外键置空前已失去可确定的所选 ID，则明确标记为**原选择未知（unknown）**，绝不从候选列表猜测。返回各类数量、原结论、当前首选与得分，支持按类别筛选，全程只读、不写日志也不改动复核记录
 - 🧪 **规则 A/B 对照实验**：提交 2～4 个命名规则档案（自动命中/拒绝/分差阈值 + 词元权重）与 1～100 条查询，在同一地址表快照下逐档运行，逐条对比状态/首选/得分/候选差异并标出不一致与触发阈值，结果按实验编号持久化回看
 - 📈 **历史回归对比**：任选两次已持久化实验，服务端按档案名称与去首尾空白后的查询逐档对齐（缺失档案 / 重复查询直接拒绝），逐单元分类为 改善 / 退化 / 仅分数变化 / 无变化 并汇总；地址表快照 digest 不同时提示不可直接比较但仍展示逐条差异；页面支持按类别筛选与 CSV 下载
 - 🔌 REST API：`/api/match`、`/api/match/batch`、`/api/addresses`、复核接口、A/B 实验接口（含 `/docs` Swagger）
@@ -510,34 +510,79 @@ curl -s 'http://localhost:8000/api/address-audit?category=best_drifted'
 | 确认首选 / 改派 | 未自动命中 | ⚠ 漏命中 `missed` |
 | 判无匹配 | 出现自动命中 | ⛔ 误命中 `false_hit` |
 | 判无匹配 | 仍未自动命中 | ✅ 一致 `consistent` |
+| 历史正向结论、所选 ID 已不可确定 | 无法对照 | ❔ 原选择未知 `unknown` |
 
+- **所选地址快照（地址删除也不丢失原结论）**：单条复核与同案组复核写入时，
+  除外键列 `selected_id`（`ON DELETE SET NULL`）外，还会把人工所选地址的
+  **ID 与全文**持久保存到 `match_logs.selected_address_id` /
+  `selected_address_text`（普通列，不随地址行删除而置空），复核得分保存在
+  `score`。回放时原结论只从这份快照还原，始终显示**原 ID、全文、复核得分**；
+  当前地址表仅用于判定所选地址**是否已删除**（`selected_missing`），删除后
+  回放自动命中其他地址记为冲突、未自动命中记为漏命中，不会退化成泛化的
+  「地址已删除」提示。程序启动时会为快照功能上线前复核、且所选地址仍存在的
+  历史记录**一次性回填**快照。
+- **原选择未知（不从候选猜测）**：若历史正向记录在外键置空前就已失去可确定的
+  所选 ID（既无快照、外键也为 `NULL`），原结论无法与当前回放对照，统一标记为
+  **原选择未知 `unknown`**，页面/API 明确提示原选择的 ID 与全文无法确定，
+  **不会**从候选列表推断；该类计入风险数，可单独筛选。
 - **每条记录展示**：原始查询与记录号、复核时间、**原结论**（动作 + 所选地址 + 复核得分；
   所选地址已被删除时明确标注）、**当前回放**（状态、当前首选及得分、判定原因）、分类判定
   说明，以及可展开的本次回放候选明细（人工所选地址带标记）。
-- **汇总与筛选**：页面顶部与 API 均返回各类数量（一致 / 冲突 / 漏命中 / 误命中）与已复核
-  总数；标签角标显示非一致记录数（冲突 + 漏命中 + 误命中）。下拉框支持按类别筛选，
-  汇总计数不受筛选影响；列表按 冲突 → 误命中 → 漏命中 → 一致 排序，风险优先。
+- **汇总与筛选**：页面顶部与 API 均返回各类数量（一致 / 冲突 / 漏命中 / 误命中 /
+  原选择未知）与已复核总数；标签角标显示非一致记录数（冲突 + 漏命中 + 误命中 +
+  原选择未知）。下拉框支持按类别筛选，汇总计数不受筛选影响；列表按
+  冲突 → 误命中 → 漏命中 → 原选择未知 → 一致 排序，风险优先。
 - **刷新即重算**：每次打开页面或点击「重新回放」都用当前地址表与默认阈值整体重算，
   便于定位规则或地址表变化带来的风险。
 - **只读**：回放只调用匹配器评分，**不写入任何匹配日志**，也**不改动任何复核记录**。
 
 ```bash
-# 查看回放清单（默认全部；category 可筛选 consistent|conflict|missed|false_hit）
+# 查看回放清单（默认全部；category 可筛选 consistent|conflict|missed|false_hit|unknown）
 curl -s http://localhost:8000/api/review-replay
 curl -s 'http://localhost:8000/api/review-replay?category=conflict'
 # => {"generated_at":"…","total_reviewed":4,"consistent":2,"conflict":1,
-#     "missed":1,"false_hit":0,"risk_count":2,
+#     "missed":1,"false_hit":0,"unknown":0,"risk_count":2,
 #     "thresholds":{"auto_threshold":0.8,...},
 #     "items":[{
 #       "match_id":2,"query":"100 Lake Dr, Austin TX",
 #       "review_action":"overridden","review_action_label":"改派",
 #       "selected_id":5,"selected_full_text":"1000 Lake Drive",
-#       "selected_missing":false,"review_score":0.7,
+#       "selected_known":true,"selected_missing":false,"review_score":0.7,
 #       "category":"conflict","category_label":"冲突",
 #       "verdict_reason":"当前回放自动命中 #4（100.0%），与人工所选地址 #5 不同",
 #       "replay_status":"auto_matched","replay_best_id":4,
 #       "replay_best_score":1.0,"replay_best_full_text":"100 Lake Drive",
 #       "replay":{"status":"auto_matched","best_id":4,"candidates":[...]}}]}
+```
+
+所选地址删除后，`selected_id` 外键会被置空，但回放仍从快照返回原 ID / 全文：
+
+```json
+{
+  "review_action": "confirmed",
+  "selected_id": 17,
+  "selected_full_text": "555 Zxqwv Replaydel Avenue, Delton 90001",
+  "selected_known": true,
+  "selected_missing": true,
+  "review_score": 0.91,
+  "category": "missed",
+  "verdict_reason": "当前回放未自动命中（状态：待确认），人工所选地址 #17 按当前规则无法自动复现；人工所选地址已删除（不在当前标准地址表中）"
+}
+```
+
+历史记录若已失去可确定的所选 ID：
+
+```json
+{
+  "review_action": "confirmed",
+  "selected_id": null,
+  "selected_full_text": null,
+  "selected_known": false,
+  "selected_missing": false,
+  "category": "unknown",
+  "category_label": "原选择未知",
+  "verdict_reason": "该记录复核于所选地址快照功能上线之前，且人工所选地址已被删除，原选择的地址 ID 与全文均无法确定，无法按当前规则对照；不会从候选列表猜测原选择"
+}
 ```
 
 ---
@@ -564,7 +609,7 @@ curl -s 'http://localhost:8000/api/review-replay?category=conflict'
 | POST | `/api/matches/{id}/review` | 单条复核：confirmed / overridden / rejected |
 | GET | `/api/review-groups` | 待确认记录的同案分组（归一化键 + 候选签名归组，含组内原始查询与数量） |
 | POST | `/api/review-groups/review` | 整组复核：单事务核对组签名与成员集合，冲突返回 409 且一条不写 |
-| GET | `/api/review-replay?category=…` | 复核结论回放：已复核记录以原查询在当前地址表上按默认规则重跑并对照人工结论，分为 一致(consistent)/冲突(conflict)/漏命中(missed)/误命中(false_hit)，返回各类数量、原结论、当前首选与得分；只读不写 |
+| GET | `/api/review-replay?category=…` | 复核结论回放：已复核记录以原查询在当前地址表上按默认规则重跑并对照人工结论，分为 一致(consistent)/冲突(conflict)/漏命中(missed)/误命中(false_hit)/原选择未知(unknown)；原 ID、全文与复核得分取自复核写入时持久保存的地址快照（不随地址删除消失），按当前地址表标注是否已删除；只读不写 |
 | GET | `/api/coverage-gaps?status=open` | 地址覆盖缺口：`no_match` 日志按归一化道路/地区词元 + 门牌号归组，每次调用用当前地址表与默认规则重跑代表查询，标记 待补录(open)/已覆盖(covered)；只读不写 |
 | GET | `/api/address-audit?category=…` | 标准地址自匹配巡检：每条标准地址以其全文按默认规则在完整地址表上评分，只列出未自动命中自身 ID 的记录，含自身分数与得分 ≥ 自身分数 − 默认分差阈值的全部阻碍候选（不受前五截断），按 自身分数不足(self_score_low)/首选偏移(best_drifted)/分差歧义(margin_ambiguous) 分类汇总；只读不写 |
 

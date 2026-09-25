@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS match_logs (
     status           TEXT NOT NULL,          -- auto_matched | needs_review | no_match
     score            REAL,
     selected_id      INTEGER REFERENCES addresses(id) ON DELETE SET NULL,
+    -- Durable snapshot of the human-chosen address, written at review time by
+    -- both the single and the same-case-group review paths.  These plain
+    -- (non-FK) columns survive the deletion of the address row, so the review
+    -- replay can always restore the original ID, full text and review score
+    -- instead of falling back to a generic "address deleted" notice.
+    selected_address_id   INTEGER,            -- chosen address ID at review time (never nulled by FK)
+    selected_address_text TEXT,               -- chosen address full_text at review time
     candidate_id     INTEGER REFERENCES addresses(id) ON DELETE SET NULL,
     token_score      REAL,
     house_score      REAL,
@@ -101,6 +108,31 @@ def init_db(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(match_logs)")}
     if "consensus_json" not in cols:
         conn.execute("ALTER TABLE match_logs ADD COLUMN consensus_json TEXT")
+    if "selected_address_id" not in cols:
+        conn.execute("ALTER TABLE match_logs ADD COLUMN selected_address_id INTEGER")
+    if "selected_address_text" not in cols:
+        conn.execute("ALTER TABLE match_logs ADD COLUMN selected_address_text TEXT")
+    # One-time backfill for reviews written before the snapshot existed: the
+    # durable ID/text are copied from the still-live FK row where possible.
+    # Records whose chosen address was already deleted keep NULL snapshots and
+    # are reported as "original choice unknown" by the replay -- never guessed
+    # from the candidate list.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(match_logs)")}
+    if "selected_address_id" in cols:
+        conn.execute(
+            """
+            UPDATE match_logs
+               SET selected_address_id = selected_id,
+                   selected_address_text = (
+                       SELECT a.full_text FROM addresses a
+                        WHERE a.id = match_logs.selected_id
+                   )
+             WHERE status = 'reviewed'
+               AND review_action IN ('confirmed', 'overridden')
+               AND selected_id IS NOT NULL
+               AND selected_address_id IS NULL
+            """
+        )
     conn.commit()
 
 
@@ -317,15 +349,30 @@ def get_match_log(conn: sqlite3.Connection, log_id: int) -> sqlite3.Row | None:
 
 
 def review_match_log(conn: sqlite3.Connection, log_id: int, *, action: str,
-                     selected_id: int | None, score: float | None) -> None:
+                     selected_id: int | None, score: float | None,
+                     selected_text: str | None = None) -> None:
+    """Write a human review decision onto a match log.
+
+    For positive decisions (``confirmed`` / ``overridden``) the chosen
+    address's ID and full text are also stored in the durable snapshot
+    columns ``selected_address_id`` / ``selected_address_text`` (plain
+    integers/strings with no foreign key, so they are not cleared when the
+    address row is later deleted).  ``rejected`` clears both the FK column
+    and the snapshot.
+    """
+    if action in ("confirmed", "overridden"):
+        durable_id, durable_text = selected_id, selected_text
+    else:
+        durable_id = durable_text = None
     conn.execute(
         """
         UPDATE match_logs
            SET status = 'reviewed', review_action = ?, selected_id = ?,
+               selected_address_id = ?, selected_address_text = ?,
                score = ?, reviewed_at = ?
          WHERE id = ?
         """,
-        (action, selected_id, score, _now(), log_id),
+        (action, selected_id, durable_id, durable_text, score, _now(), log_id),
     )
 
 

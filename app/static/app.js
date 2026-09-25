@@ -636,6 +636,7 @@ const REPLAY_CATEGORY_LABEL = {
     conflict: "冲突",
     missed: "漏命中",
     false_hit: "误命中",
+    unknown: "原选择未知",
 };
 
 // The replay re-scores every reviewed record on each call, so (like the gaps
@@ -646,13 +647,17 @@ function renderReplayItem(item) {
     let original;
     if (item.review_action === "rejected") {
         original = "<b>判无匹配</b>";
-    } else if (item.selected_id !== null && item.selected_id !== undefined) {
+    } else if (item.selected_known && item.selected_id !== null && item.selected_id !== undefined) {
         original = `<b>${escapeHtml(item.review_action_label)}</b> → ` +
             `#${item.selected_id} ${escapeHtml(item.selected_full_text || "")}` +
             `${item.selected_missing ? "（已删除）" : ""}` +
             `<span class="muted">（复核得分 ${pct(item.review_score)}）</span>`;
     } else {
-        original = `<b>${escapeHtml(item.review_action_label)}</b> → 所选地址已删除`;
+        // Legacy positive review whose chosen address was deleted before the
+        // review-time snapshot existed: the original choice is genuinely lost.
+        original = `<b>${escapeHtml(item.review_action_label)}</b> → ` +
+            `<span class="replay-unknown">原选择未知（所选地址已删除且无复核时快照）</span>` +
+            `<span class="muted">（复核得分 ${pct(item.review_score)}）</span>`;
     }
     const bestLine = item.replay_best_id !== null && item.replay_best_id !== undefined
         ? `当前首选：<b>#${item.replay_best_id}</b> ${escapeHtml(item.replay_best_full_text || "")}` +
@@ -700,7 +705,8 @@ async function loadReviewReplay() {
             `<span class="replay-cat consistent">一致 ${data.consistent}</span> ` +
             `<span class="replay-cat conflict">冲突 ${data.conflict}</span> ` +
             `<span class="replay-cat missed">漏命中 ${data.missed}</span> ` +
-            `<span class="replay-cat false_hit">误命中 ${data.false_hit}</span>` +
+            `<span class="replay-cat false_hit">误命中 ${data.false_hit}</span> ` +
+            `<span class="replay-cat unknown">原选择未知 ${data.unknown || 0}</span>` +
             ` · 回放时间 ${escapeHtml(data.generated_at)}</span>`;
         if (data.items.length === 0) {
             list.innerHTML = filter
